@@ -32,3 +32,12 @@ Thumbs.db
 # Ignore dataset files
 /data
 *.pdf
+
+# Ignore compiled Spark files
+*.class
+*.jar
+*.pyc
+/spark-warehouse/
+
+# Ignore Hadoop binaries
+/hadoop/
