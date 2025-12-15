@@ -38,6 +38,7 @@ Thumbs.db
 *.jar
 *.pyc
 /spark-warehouse/
+etl_checkpoint.json
 
 # Ignore Hadoop binaries
 /hadoop/

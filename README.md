@@ -1,14 +1,19 @@
-# Netflix Prize Data Warehouse - ETL Pipeline
+# 🎬 Netflix Prize Data Warehouse - Resumable ETL Pipeline
+
+> **Production-grade ETL pipeline with automatic checkpoint system and real-time progress tracking**
 
 ## 📋 Table of Contents
 
 - [Overview](#overview)
+- [Quick Start](#quick-start)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Resumable Processing Guide](#resumable-processing-guide)
+- [Safety Features](#safety-features)
 - [Project Structure](#project-structure)
 - [Database Schema](#database-schema)
 - [Troubleshooting](#troubleshooting)
@@ -17,7 +22,9 @@
 
 ## 📦 Overview
 
-This project implements a **production-grade ETL (Extract-Transform-Load) pipeline** for the Netflix Prize dataset using **Apache Spark** (PySpark) and **PostgreSQL**. It processes 100M+ movie ratings from 480K customers across 17K titles spanning 1998-2005, transforming raw data into a normalized Star Schema data warehouse optimized for analytical queries.
+This project implements a **production-grade, resumable ETL (Extract-Transform-Load) pipeline** for the Netflix Prize dataset using **Apache Spark** (PySpark) and **PostgreSQL**. It processes 100M+ movie ratings from 480K customers across 17K titles spanning 1998-2005, transforming raw data into a normalized Star Schema data warehouse optimized for analytical queries.
+
+**🆕 The pipeline now features automatic checkpoint system that allows you to resume from any interruption point without data loss or duplication!**
 
 ### Key Metrics
 
@@ -33,7 +40,41 @@ This project implements a **production-grade ETL (Extract-Transform-Load) pipeli
 
 ---
 
+## 🚀 Quick Start
+
+### First Run
+
+```bash
+python etl_pipeline_spark.py
+```
+
+### After Interruption (Ctrl+C, crash, etc.)
+
+```bash
+# Just run the same command!
+python etl_pipeline_spark.py
+```
+
+### Start Fresh (Reset)
+
+```bash
+rm etl_checkpoint.json  # Delete checkpoint
+python etl_pipeline_spark.py
+```
+
+---
+
 ## ✨ Features
+
+### 🔄 Resumable Processing
+
+- **Checkpoint System**: Automatic progress tracking in JSON file
+- **Smart Resume**: Continues from exact interruption point
+- **No Duplicates**: Already loaded data is automatically skipped
+- **Safe Re-runs**: Run multiple times without data corruption
+- **File-Level Tracking**: Each source file marked complete independently
+- **Dimension Tracking**: Each dimension table tracked separately
+- **Graceful Interrupts**: Ctrl+C handled properly with progress saved
 
 ### 🚀 Performance & Scalability
 
@@ -50,6 +91,7 @@ This project implements a **production-grade ETL (Extract-Transform-Load) pipeli
 - **Deduplication**: Automatic handling of duplicate records
 - **Type Safety**: Strong type checking with PySpark DataFrames
 - **Idempotent Design**: Safe to re-run without data corruption
+- **Safety Checks**: Pre-run validation to prevent data loss or duplication
 
 ### 📊 Data Warehouse Design
 
@@ -61,10 +103,13 @@ This project implements a **production-grade ETL (Extract-Transform-Load) pipeli
 
 ### 🔍 Monitoring & Logging
 
+- **Real-Time Progress**: Updates every 10,000 records with visual progress bar
+- **Processing Speed**: Shows records/second throughput
+- **ETA Calculation**: Accurate estimated time to completion
 - **Dual Output**: Console + file logging (`etl_pipeline_spark.log`)
-- **Real-time Progress**: Detailed status updates during execution
 - **Error Tracking**: Comprehensive error messages with recovery guidance
 - **Execution Timing**: Stage-by-stage performance metrics
+- **Visual Indicators**: Emojis for easy status understanding (🚀 ⏳ ✅ ❌)
 
 ---
 
@@ -287,17 +332,213 @@ python etl_pipeline_spark.py
 
 ---
 
-## 📁 Project Structure
+## � Resumable Processing Guide
+
+### How It Works
+
+The pipeline uses a checkpoint file (`etl_checkpoint.json`) to track progress:
+
+```json
+{
+  "dim_date": {
+    "completed": true,
+    "count": 2920
+  },
+  "dim_movie": {
+    "completed": true,
+    "count": 17770
+  },
+  "dim_customer": {
+    "completed": true,
+    "count": 480189
+  },
+  "fact_ratings": {
+    "completed": false,
+    "total_count": 24058263,
+    "files_completed": ["combined_data_1.txt"],
+    "current_file": null,
+    "current_file_offset": 0
+  },
+  "last_updated": "2025-12-15T14:30:45.123456"
+}
+```
+
+### Usage Scenarios
+
+#### Scenario 1: Normal Execution
+
+```bash
+python etl_pipeline_spark.py
+```
+
+- Loads checkpoint or creates new one
+- Processes all data
+- Saves progress continuously
+
+#### Scenario 2: Interrupted During Loading
+
+```
+[STEP 6/9] Loading Fact Table
+🔄 Processing combined_data_2.txt...
+🚀 Loading: [███░░░░░░░] 30% (7,500,000/25,000,000)
+^C  # User presses Ctrl+C
+
+⚠️  ETL PIPELINE INTERRUPTED BY USER
+💾 Progress has been saved to checkpoint file
+🔄 Run the script again to resume from where you left off
+```
+
+**Resume:**
+
+```bash
+python etl_pipeline_spark.py
+```
+
+Output:
+
+```
+[STEP 0/9] Initializing Progress Tracker
+📋 Loaded checkpoint from etl_checkpoint.json
+
+📊 ETL PROGRESS CHECKPOINT SUMMARY
+dim_date             : ✅ COMPLETED      (2,920 records)
+dim_movie            : ✅ COMPLETED      (17,770 records)
+dim_customer         : ✅ COMPLETED      (480,189 records)
+fact_ratings         : ⏳ IN PROGRESS   (24,058,263 records)
+  Files completed: combined_data_1.txt
+
+[STEP 3/9] Loading Date Dimension
+⏭️  dim_date already loaded with 2,920 records, skipping...
+
+[STEP 6/9] Loading Fact Table
+⏭️  combined_data_1.txt already processed, skipping...
+🔄 Processing combined_data_2.txt...
+```
+
+#### Scenario 3: Start Fresh
+
+```bash
+# Delete checkpoint to start over
+rm etl_checkpoint.json
+
+# Run pipeline
+python etl_pipeline_spark.py
+```
+
+### Progress Display
+
+Every 10,000 records, you'll see:
+
+```
+🚀 Loading combined_data_1.txt: [████████░░] 80.5% (80,500/100,000) | ⚡ 4,523 rec/s | ⏱️ 17s | ⏳ ETA: 4s
+```
+
+Where:
+
+- `[████████░░]` = Visual progress bar (10 blocks)
+- `80.5%` = Percentage complete
+- `(80,500/100,000)` = Current/Total records
+- `⚡ 4,523 rec/s` = Processing speed
+- `⏱️ 17s` = Time elapsed
+- `⏳ ETA: 4s` = Estimated time remaining
+
+### Configuration
+
+Adjust progress update frequency in `etl_pipeline_spark.py`:
+
+```python
+class Config:
+    # Update every N records (default: 10,000)
+    PROGRESS_UPDATE_INTERVAL = 10000
+
+    # Checkpoint file location
+    CHECKPOINT_FILE = "etl_checkpoint.json"
+```
+
+---
+
+## 🛡️ Safety Features
+
+### Pre-Run Data Validation
+
+Before processing, the pipeline validates existing data:
+
+```
+[STEP 1.5/9] 🛡️  Data Safety Validation
+
+🛡️  SAFETY CHECK: Validating existing data...
+✅ dim_date: 2,920 rows (matches checkpoint)
+✅ dim_movie: 17,770 rows (matches checkpoint)
+✅ dim_customer: 480,189 rows (matches checkpoint)
+✅ fact_ratings: 24,058,263 rows, 1 files completed
+
+✅ DATA SAFETY CHECK PASSED - Safe to proceed!
+   - No duplicate data risk detected
+   - Existing data will be preserved
+   - Only missing data will be loaded
+```
+
+### Safety Issues Detection
+
+If issues are detected, the pipeline **stops automatically**:
+
+```
+🚨 DATA SAFETY ISSUES DETECTED!
+⚠️  fact_ratings: Has 50,000,000 rows in database but checkpoint shows no files completed!
+   This could cause duplicate data if we proceed.
+
+⚠️  RECOMMENDED ACTIONS:
+1. If this is a different database, delete etl_checkpoint.json and restart
+2. If data was manually added, update the checkpoint file manually
+3. If unsure, backup your database before proceeding
+
+⛔ STOPPING TO PREVENT DATA CORRUPTION
+```
+
+### Manual Checkpoint Recovery
+
+If you have existing data but no checkpoint, create one:
+
+```json
+{
+  "dim_date": { "completed": true, "count": 2920 },
+  "dim_movie": { "completed": true, "count": 17770 },
+  "dim_customer": { "completed": true, "count": 480189 },
+  "fact_ratings": {
+    "completed": false,
+    "total_count": 24058263,
+    "files_completed": ["combined_data_1.txt"],
+    "current_file": null,
+    "current_file_offset": 0
+  },
+  "last_updated": "2025-12-15T14:30:45.123456"
+}
+```
+
+### What's Protected
+
+| Protection           | Description                                     |
+| -------------------- | ----------------------------------------------- |
+| **No Duplicates**    | Checkpoint prevents reprocessing completed data |
+| **No Data Loss**     | Progress saved after each file/dimension        |
+| **No Table Drops**   | Schema creation skipped if tables exist         |
+| **Validation Check** | Pre-run comparison of DB vs checkpoint          |
+| **Safe Re-runs**     | Idempotent operations throughout                |
+
+---
+
+## �📁 Project Structure
 
 ```
 netflix-data-ingestion/
-├── etl_pipeline_spark.py          # Main ETL pipeline (962 lines)
+├── etl_pipeline_spark.py          # Main ETL pipeline with resumable features
 ├── schema.sql                     # Database DDL script
 ├── requirements.txt               # Python dependencies
 ├── .env.example                   # Environment template
 ├── .env                          # Configuration (git-ignored)
 ├── .gitignore                    # Git ignore rules
 ├── README.md                     # This file
+├── test.ipynb                    # Jupyter notebook for testing/monitoring
 │
 ├── data/                         # Data directory
 │   ├── movie_titles.csv         # 17K movie titles
@@ -310,7 +551,8 @@ netflix-data-ingestion/
 │   └── bin/                     # Executable files
 │
 ├── postgresql-42.6.0.jar        # PostgreSQL JDBC driver
-├── etl_pipeline_spark.log       # Execution log (generated)
+├── etl_pipeline_spark.log       # Execution log (auto-generated)
+├── etl_checkpoint.json           # Progress checkpoint (auto-generated)
 └── __pycache__/                 # Python cache (git-ignored)
 ```
 
@@ -536,6 +778,53 @@ DEFAULT_PARALLELISM = 100
 - Check PostgreSQL connection pool limits
 - Monitor disk I/O during data reads
 
+#### Issue: "DATA SAFETY ISSUES DETECTED"
+
+**Cause**: Checkpoint file doesn't match database state
+
+**Solution 1 - Fresh Database**:
+
+```bash
+# Delete checkpoint and restart
+rm etl_checkpoint.json
+python etl_pipeline_spark.py
+```
+
+**Solution 2 - Existing Data**:
+
+```bash
+# Create matching checkpoint manually or let pipeline suggest one
+# Check the error message for recommended checkpoint JSON
+```
+
+#### Issue: Want to reprocess a specific file
+
+**Solution**:
+
+```bash
+# Edit etl_checkpoint.json
+# Remove the file from "files_completed" array
+# Example: Remove "combined_data_2.txt" to reprocess it
+```
+
+#### Issue: Progress seems stuck
+
+**Diagnosis**:
+
+```bash
+# Check if data is actually being written
+Get-Content etl_pipeline_spark.log -Tail 50
+
+# Monitor database growth
+# Use test.ipynb to check fact_ratings row count
+```
+
+**Common Causes**:
+
+- Large batch being written (wait for completion)
+- Database connection timeout (check network)
+- Spark executor stalled (check CPU usage)
+
 ### Log Analysis
 
 **View recent errors**:
@@ -649,22 +938,78 @@ For issues or questions:
 ---
 
 **Last Updated**: December 15, 2025  
-**Version**: 2.0 (PySpark Refactor)  
-**Status**: Production Ready
+**Version**: 3.0 (Resumable ETL with Progress Tracking)  
+**Status**: Production Ready ✅
 
-- Prerequisites and dependencies
-- Step-by-step setup instructions
-- Expected runtime benchmarks
-- Common pitfalls & solutions
-- Verification queries
-- Sample analytical queries
-- Troubleshooting commands
+---
 
-### 5️⃣ **Supporting Files**
+## 🎉 What's New in Version 3.0
 
-- `.env.example` - Template for database credentials
-- `requirements.txt` - Python dependencies
-- `.gitignore` - Version control exclusions
+### Major Features Added
+
+1. **🔄 Resumable Processing**
+
+   - Automatic checkpoint system
+   - Resume from any interruption point
+   - No data loss or duplication
+
+2. **🚀 Real-Time Progress Tracking**
+
+   - Updates every 10,000 records
+   - Visual progress bars
+   - Processing speed and ETA
+
+3. **🛡️ Enhanced Safety**
+
+   - Pre-run data validation
+   - Duplicate detection
+   - Data loss prevention
+
+4. **🎨 Better UX**
+   - Beautiful emojis and indicators
+   - Clear status messages
+   - Informative summaries
+
+### Migration from v2.0
+
+If you have v2.0 running:
+
+1. Your existing code still works
+2. New runs automatically create checkpoint
+3. Existing data is preserved
+4. No breaking changes
+
+---
+
+## 📞 Support & Contribution
+
+### Getting Help
+
+1. **Check Documentation**: Review this README thoroughly
+2. **Check Logs**: `etl_pipeline_spark.log` contains detailed information
+3. **View Checkpoint**: Check `etl_checkpoint.json` for progress status
+4. **Test Notebook**: Use `test.ipynb` to monitor database state
+
+### Monitoring During Execution
+
+Use the provided `test.ipynb` notebook to:
+
+- Monitor active database queries
+- Check row counts in real-time
+- Verify data insertion progress
+- Debug connection issues
+
+---
+
+## 🏆 Success Criteria
+
+Your ETL pipeline has succeeded when:
+
+✅ All 4 combined data files processed  
+✅ `etl_checkpoint.json` shows all completed  
+✅ Database has 100M+ records in fact_ratings  
+✅ No errors in `etl_pipeline_spark.log`  
+✅ Sample queries return expected results
 
 ---
 

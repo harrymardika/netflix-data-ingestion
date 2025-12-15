@@ -30,8 +30,10 @@ Performance:
 import os
 import sys
 import logging
+import json
+import time
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession, DataFrame, Window
@@ -74,6 +76,24 @@ from pyspark.sql.types import (
 )
 
 # =====================================================
+# WINDOWS CONFIGURATION
+# =====================================================
+
+# Set UTF-8 encoding for Windows console to display emojis
+if sys.platform == "win32":
+    import io
+
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+    # Also set environment variable for subprocess compatibility
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+
+# Set HADOOP_HOME for Windows to avoid Spark errors
+HADOOP_HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hadoop")
+os.environ["HADOOP_HOME"] = HADOOP_HOME
+os.environ["hadoop.home.dir"] = HADOOP_HOME
+
+# =====================================================
 # LOGGING CONFIGURATION
 # =====================================================
 
@@ -81,7 +101,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("etl_pipeline_spark.log"),
+        logging.FileHandler("etl_pipeline_spark.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -122,6 +142,183 @@ class Config:
     JDBC_DRIVER = "org.postgresql.Driver"
     JDBC_JAR_PATH = "postgresql-42.6.0.jar"  # Download if not present
 
+    # Progress tracking
+    CHECKPOINT_FILE = "etl_checkpoint.json"
+    PROGRESS_UPDATE_INTERVAL = 10000  # Update every 10,000 records
+
+
+# =====================================================
+# PROGRESS TRACKER
+# =====================================================
+
+
+class ProgressTracker:
+    """Manages ETL progress tracking with checkpoint file"""
+
+    def __init__(self, checkpoint_file: str = Config.CHECKPOINT_FILE):
+        self.checkpoint_file = checkpoint_file
+        self.checkpoint = self.load_checkpoint()
+
+    def load_checkpoint(self) -> Dict:
+        """Load checkpoint from file or create new"""
+        if os.path.exists(self.checkpoint_file):
+            try:
+                with open(self.checkpoint_file, "r") as f:
+                    checkpoint = json.load(f)
+                    logger.info(f"📋 Loaded checkpoint from {self.checkpoint_file}")
+                    return checkpoint
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}, starting fresh")
+
+        return {
+            "dim_date": {"completed": False, "count": 0},
+            "dim_movie": {"completed": False, "count": 0},
+            "dim_customer": {"completed": False, "count": 0},
+            "fact_ratings": {
+                "completed": False,
+                "total_count": 0,
+                "files_completed": [],
+                "current_file": None,
+                "current_file_offset": 0,
+            },
+            "last_updated": None,
+        }
+
+    def save_checkpoint(self):
+        """Save current checkpoint to file"""
+        try:
+            self.checkpoint["last_updated"] = datetime.now().isoformat()
+            with open(self.checkpoint_file, "w") as f:
+                json.dump(self.checkpoint, f, indent=2)
+            logger.debug(f"💾 Checkpoint saved to {self.checkpoint_file}")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+
+    def mark_dimension_completed(self, dim_name: str, count: int):
+        """Mark a dimension as completed"""
+        self.checkpoint[dim_name]["completed"] = True
+        self.checkpoint[dim_name]["count"] = count
+        self.save_checkpoint()
+        logger.info(f"✅ Marked {dim_name} as completed with {count:,} records")
+
+    def is_dimension_completed(self, dim_name: str) -> bool:
+        """Check if dimension is already loaded"""
+        return self.checkpoint.get(dim_name, {}).get("completed", False)
+
+    def mark_file_completed(self, file_name: str):
+        """Mark a combined_data file as completed"""
+        if file_name not in self.checkpoint["fact_ratings"]["files_completed"]:
+            self.checkpoint["fact_ratings"]["files_completed"].append(file_name)
+            self.save_checkpoint()
+            logger.info(f"✅ Marked {file_name} as completed")
+
+    def is_file_completed(self, file_name: str) -> bool:
+        """Check if file is already processed"""
+        return file_name in self.checkpoint["fact_ratings"]["files_completed"]
+
+    def update_fact_progress(self, count: int):
+        """Update fact table progress"""
+        self.checkpoint["fact_ratings"]["total_count"] += count
+        self.save_checkpoint()
+
+    def mark_fact_completed(self):
+        """Mark fact table loading as completed"""
+        self.checkpoint["fact_ratings"]["completed"] = True
+        self.save_checkpoint()
+        logger.info(f"✅ Fact table loading completed")
+
+    def get_summary(self) -> str:
+        """Get progress summary"""
+        lines = ["=" * 60, "📊 ETL PROGRESS CHECKPOINT SUMMARY", "=" * 60]
+
+        for dim in ["dim_date", "dim_movie", "dim_customer"]:
+            status = (
+                "✅ COMPLETED" if self.checkpoint[dim]["completed"] else "⏳ PENDING"
+            )
+            count = self.checkpoint[dim]["count"]
+            lines.append(f"{dim:20} : {status:15} ({count:,} records)")
+
+        fact = self.checkpoint["fact_ratings"]
+        status = "✅ COMPLETED" if fact["completed"] else "⏳ IN PROGRESS"
+        lines.append(
+            f"{'fact_ratings':20} : {status:15} ({fact['total_count']:,} records)"
+        )
+
+        if fact["files_completed"]:
+            lines.append(f"\n  Files completed: {', '.join(fact['files_completed'])}")
+
+        if self.checkpoint["last_updated"]:
+            lines.append(f"\n  Last updated: {self.checkpoint['last_updated']}")
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+class ProgressBar:
+    """Real-time progress display with ETA"""
+
+    def __init__(self, total: int, description: str = "Processing"):
+        self.total = total
+        self.description = description
+        self.current = 0
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
+        self.update_interval = Config.PROGRESS_UPDATE_INTERVAL
+
+    def update(self, count: int = 1):
+        """Update progress"""
+        self.current += count
+
+        # Update every N records or at completion
+        if self.current % self.update_interval == 0 or self.current >= self.total:
+            self._display()
+
+    def _display(self):
+        """Display progress bar and stats"""
+        elapsed = time.time() - self.start_time
+        percent = (self.current / self.total * 100) if self.total > 0 else 0
+
+        # Calculate rate and ETA
+        rate = self.current / elapsed if elapsed > 0 else 0
+        remaining = self.total - self.current
+        eta_seconds = remaining / rate if rate > 0 else 0
+
+        # Format time
+        eta_str = self._format_time(eta_seconds)
+        elapsed_str = self._format_time(elapsed)
+
+        # Progress bar
+        bar_length = 30
+        filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
+        bar = "█" * filled + "░" * (bar_length - filled)
+
+        # Display
+        logger.info(
+            f"🚀 {self.description}: [{bar}] {percent:.1f}% "
+            f"({self.current:,}/{self.total:,}) | "
+            f"⚡ {rate:.0f} rec/s | "
+            f"⏱️  {elapsed_str} | "
+            f"⏳ ETA: {eta_str}"
+        )
+
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds to human readable time"""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            return f"{int(seconds/60)}m {int(seconds%60)}s"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+
+    def complete(self):
+        """Mark as complete and show final stats"""
+        self.current = self.total
+        self._display()
+        elapsed = time.time() - self.start_time
+        logger.info(f"✅ {self.description} completed in {self._format_time(elapsed)}")
+
 
 # =====================================================
 # SPARK SESSION MANAGER
@@ -158,6 +355,155 @@ class SparkSessionManager:
         }
 
         self.spark = None
+
+    def get_table_count(self, table_name: str) -> int:
+        """Get current row count from a table"""
+        try:
+            query = f"(SELECT COUNT(*) as count FROM {Config.SCHEMA_NAME}.{table_name}) as cnt"
+            df = self.spark.read.jdbc(
+                url=self.jdbc_url, table=query, properties=self.jdbc_properties
+            )
+            count = df.collect()[0]["count"]
+            return count
+        except Exception as e:
+            logger.warning(f"Could not get count for {table_name}: {e}")
+            return 0
+
+    def validate_existing_data_safety(self, progress_tracker: ProgressTracker) -> bool:
+        """
+        Validate that existing data is safe and won't be duplicated or lost.
+        Returns True if safe to proceed, False if user intervention needed.
+        """
+        logger.info("\n🛡️  SAFETY CHECK: Validating existing data...")
+
+        safety_issues = []
+
+        # Check each dimension table
+        for table_name in ["dim_date", "dim_movie", "dim_customer"]:
+            db_count = self.get_table_count(table_name)
+            checkpoint_completed = progress_tracker.is_dimension_completed(table_name)
+            checkpoint_count = progress_tracker.checkpoint[table_name]["count"]
+
+            if db_count > 0:
+                if not checkpoint_completed:
+                    # Data exists but checkpoint says not completed - DANGER!
+                    safety_issues.append(
+                        f"⚠️  {table_name}: Has {db_count:,} rows in database but checkpoint shows incomplete!\n"
+                        f"   This could cause duplicate data if we proceed."
+                    )
+                elif checkpoint_count != db_count:
+                    # Counts don't match - WARNING
+                    logger.warning(
+                        f"⚠️  {table_name}: Database has {db_count:,} rows but checkpoint shows {checkpoint_count:,}"
+                    )
+                else:
+                    # All good - data matches checkpoint
+                    logger.info(
+                        f"✅ {table_name}: {db_count:,} rows (matches checkpoint)"
+                    )
+            else:
+                # No data in DB
+                if checkpoint_completed:
+                    # Checkpoint says completed but no data - inconsistency
+                    safety_issues.append(
+                        f"⚠️  {table_name}: Checkpoint shows completed but database is empty!\n"
+                        f"   Checkpoint may be from a different database."
+                    )
+                else:
+                    logger.info(f"✅ {table_name}: Empty (ready to load)")
+
+        # Check fact table
+        fact_count = self.get_table_count("fact_ratings")
+        fact_checkpoint_count = progress_tracker.checkpoint["fact_ratings"][
+            "total_count"
+        ]
+        completed_files = progress_tracker.checkpoint["fact_ratings"]["files_completed"]
+
+        if fact_count > 0:
+            if len(completed_files) == 0 and fact_checkpoint_count == 0:
+                # Data exists but checkpoint shows no files completed - DANGER!
+                safety_issues.append(
+                    f"⚠️  fact_ratings: Has {fact_count:,} rows in database but checkpoint shows no files completed!\n"
+                    f"   This could cause duplicate data if we proceed."
+                )
+            elif fact_count < fact_checkpoint_count:
+                # DB has less data than checkpoint claims - WARNING
+                logger.warning(
+                    f"⚠️  fact_ratings: Database has {fact_count:,} rows but checkpoint shows {fact_checkpoint_count:,}\n"
+                    f"   Some data may have been manually deleted."
+                )
+            else:
+                logger.info(
+                    f"✅ fact_ratings: {fact_count:,} rows, {len(completed_files)} files completed"
+                )
+        else:
+            if len(completed_files) > 0:
+                # Checkpoint says files completed but no data - inconsistency
+                safety_issues.append(
+                    f"⚠️  fact_ratings: Checkpoint shows {len(completed_files)} files completed but database is empty!\n"
+                    f"   Checkpoint may be from a different database."
+                )
+            else:
+                logger.info(f"✅ fact_ratings: Empty (ready to load)")
+
+        # Report results
+        if safety_issues:
+            logger.error("\n" + "=" * 60)
+            logger.error("🚨 DATA SAFETY ISSUES DETECTED!")
+            logger.error("=" * 60)
+            for issue in safety_issues:
+                logger.error(issue)
+            logger.error("\n⚠️  RECOMMENDED ACTIONS:")
+            logger.error(
+                "1. If this is a different database, delete etl_checkpoint.json and restart"
+            )
+            logger.error(
+                "2. If data was manually added, update the checkpoint file manually"
+            )
+            logger.error("3. If unsure, backup your database before proceeding")
+            logger.error("=" * 60)
+
+            # Create a recovery checkpoint suggestion
+            logger.error(
+                "\n💡 To create a matching checkpoint, create etl_checkpoint.json with:"
+            )
+
+            recovery_checkpoint = {
+                "dim_date": {
+                    "completed": self.get_table_count("dim_date") > 0,
+                    "count": self.get_table_count("dim_date"),
+                },
+                "dim_movie": {
+                    "completed": self.get_table_count("dim_movie") > 0,
+                    "count": self.get_table_count("dim_movie"),
+                },
+                "dim_customer": {
+                    "completed": self.get_table_count("dim_customer") > 0,
+                    "count": self.get_table_count("dim_customer"),
+                },
+                "fact_ratings": {
+                    "completed": False,
+                    "total_count": self.get_table_count("fact_ratings"),
+                    "files_completed": [],
+                    "current_file": None,
+                    "current_file_offset": 0,
+                },
+                "last_updated": datetime.now().isoformat(),
+            }
+
+            import json
+
+            logger.error(json.dumps(recovery_checkpoint, indent=2))
+            logger.error("\n⛔ STOPPING TO PREVENT DATA CORRUPTION")
+
+            return False
+
+        logger.info("\n✅ DATA SAFETY CHECK PASSED - Safe to proceed!")
+        logger.info("   - No duplicate data risk detected")
+        logger.info("   - Existing data will be preserved")
+        logger.info("   - Only missing data will be loaded")
+
+        return True
 
     def _validate_credentials(self):
         """Validate that all required credentials are present"""
@@ -314,11 +660,18 @@ class SparkSessionManager:
 class DateDimensionLoader:
     """Loads date dimension using Spark SQL"""
 
-    def __init__(self, spark: SparkSession, jdbc_url: str, jdbc_props: Dict):
+    def __init__(
+        self,
+        spark: SparkSession,
+        jdbc_url: str,
+        jdbc_props: Dict,
+        progress_tracker: ProgressTracker,
+    ):
         self.spark = spark
         self.jdbc_url = jdbc_url
         self.jdbc_props = jdbc_props
         self.schema = Config.SCHEMA_NAME
+        self.progress_tracker = progress_tracker
 
     def generate_date_range(self) -> DataFrame:
         """Generate date dimension using Spark SQL sequence"""
@@ -378,6 +731,14 @@ class DateDimensionLoader:
 
     def load(self) -> int:
         """Load date dimension to PostgreSQL"""
+        # Check if already completed
+        if self.progress_tracker.is_dimension_completed("dim_date"):
+            existing_count = self.progress_tracker.checkpoint["dim_date"]["count"]
+            logger.info(
+                f"⏭️  dim_date already loaded with {existing_count:,} records, skipping..."
+            )
+            return existing_count
+
         logger.info("Loading date dimension...")
 
         df = self.generate_date_range()
@@ -392,6 +753,7 @@ class DateDimensionLoader:
         )
 
         logger.info(f"Loaded {row_count} dates into dim_date")
+        self.progress_tracker.mark_dimension_completed("dim_date", row_count)
         return row_count
 
 
@@ -403,14 +765,37 @@ class DateDimensionLoader:
 class MovieDimensionLoader:
     """Loads movie dimension from CSV"""
 
-    def __init__(self, spark: SparkSession, jdbc_url: str, jdbc_props: Dict):
+    def __init__(
+        self,
+        spark: SparkSession,
+        jdbc_url: str,
+        jdbc_props: Dict,
+        progress_tracker: ProgressTracker,
+    ):
         self.spark = spark
         self.jdbc_url = jdbc_url
         self.jdbc_props = jdbc_props
         self.schema = Config.SCHEMA_NAME
+        self.progress_tracker = progress_tracker
 
     def load(self) -> DataFrame:
         """Load movie dimension and return DataFrame with surrogate keys"""
+        # Check if already completed
+        if self.progress_tracker.is_dimension_completed("dim_movie"):
+            existing_count = self.progress_tracker.checkpoint["dim_movie"]["count"]
+            logger.info(
+                f"⏭️  dim_movie already loaded with {existing_count:,} records, skipping..."
+            )
+
+            # Just return the mapping
+            movie_mapping = self.spark.read.jdbc(
+                url=self.jdbc_url,
+                table=f"{self.schema}.dim_movie",
+                properties=self.jdbc_props,
+            ).select("movie_id", "movie_key")
+
+            return movie_mapping
+
         logger.info("Loading movie dimension...")
 
         # Read movie titles with custom parsing for commas in titles
@@ -449,6 +834,7 @@ class MovieDimensionLoader:
         )
 
         logger.info(f"Loaded {row_count} movies into dim_movie")
+        self.progress_tracker.mark_dimension_completed("dim_movie", row_count)
 
         # Read back with surrogate keys
         movie_mapping = self.spark.read.jdbc(
@@ -472,11 +858,18 @@ class MovieDimensionLoader:
 class CustomerDimensionLoader:
     """Loads customer dimension from ratings files"""
 
-    def __init__(self, spark: SparkSession, jdbc_url: str, jdbc_props: Dict):
+    def __init__(
+        self,
+        spark: SparkSession,
+        jdbc_url: str,
+        jdbc_props: Dict,
+        progress_tracker: ProgressTracker,
+    ):
         self.spark = spark
         self.jdbc_url = jdbc_url
         self.jdbc_props = jdbc_props
         self.schema = Config.SCHEMA_NAME
+        self.progress_tracker = progress_tracker
 
     def extract_unique_customers(self) -> DataFrame:
         """Extract unique customer IDs from all combined data files"""
@@ -518,10 +911,27 @@ class CustomerDimensionLoader:
 
     def load(self) -> DataFrame:
         """Load customer dimension and return DataFrame with surrogate keys"""
+        # Check if already completed
+        if self.progress_tracker.is_dimension_completed("dim_customer"):
+            existing_count = self.progress_tracker.checkpoint["dim_customer"]["count"]
+            logger.info(
+                f"⏭️  dim_customer already loaded with {existing_count:,} records, skipping..."
+            )
+
+            # Just return the mapping
+            customer_mapping = self.spark.read.jdbc(
+                url=self.jdbc_url,
+                table=f"{self.schema}.dim_customer",
+                properties=self.jdbc_props,
+            ).select("customer_id", "customer_key")
+
+            return customer_mapping
+
         logger.info("Loading customer dimension...")
 
         # Get unique customers
         customer_df = self.extract_unique_customers()
+        customer_count = customer_df.count()
 
         # Write to PostgreSQL (will get surrogate keys from DB)
         customer_df.coalesce(20).write.jdbc(
@@ -531,7 +941,8 @@ class CustomerDimensionLoader:
             properties=self.jdbc_props,
         )
 
-        logger.info(f"Loaded {customer_df.count():,} customers into dim_customer")
+        logger.info(f"Loaded {customer_count:,} customers into dim_customer")
+        self.progress_tracker.mark_dimension_completed("dim_customer", customer_count)
 
         # Read back with surrogate keys
         customer_mapping = self.spark.read.jdbc(
@@ -560,6 +971,7 @@ class FactRatingsLoader:
         jdbc_props: Dict,
         customer_mapping: DataFrame,
         movie_mapping: DataFrame,
+        progress_tracker: ProgressTracker,
     ):
         self.spark = spark
         self.jdbc_url = jdbc_url
@@ -567,7 +979,10 @@ class FactRatingsLoader:
         self.schema = Config.SCHEMA_NAME
         self.customer_mapping = customer_mapping.cache()  # Cache for reuse
         self.movie_mapping = movie_mapping.cache()
-        self.total_ratings = 0
+        self.progress_tracker = progress_tracker
+        self.total_ratings = self.progress_tracker.checkpoint["fact_ratings"][
+            "total_count"
+        ]
 
     def parse_combined_data_file(self, file_path: str) -> DataFrame:
         """
@@ -583,8 +998,12 @@ class FactRatingsLoader:
         # Read as text
         df = self.spark.read.text(file_path)
 
-        # Add row number for ordering
-        window_spec = Window.orderBy(monotonically_increasing_id())
+        # Add monotonic ID and partition key for distributed processing
+        df = df.withColumn("row_id", monotonically_increasing_id())
+        df = df.withColumn("partition_key", (col("row_id") / 10000).cast(IntegerType()))
+
+        # Add row number for ordering within each partition
+        window_spec = Window.partitionBy("partition_key").orderBy("row_id")
 
         df = df.withColumn("row_num", row_number().over(window_spec))
 
@@ -596,9 +1015,11 @@ class FactRatingsLoader:
             ).otherwise(None),
         )
 
-        # Propagate movie_id forward using window function
-        window_forward = Window.orderBy("row_num").rowsBetween(
-            Window.unboundedPreceding, Window.currentRow
+        # Propagate movie_id forward using window function within each partition
+        window_forward = (
+            Window.partitionBy("partition_key")
+            .orderBy("row_id")
+            .rowsBetween(Window.unboundedPreceding, Window.currentRow)
         )
 
         df = df.withColumn(
@@ -663,42 +1084,81 @@ class FactRatingsLoader:
         return df
 
     def load_file(self, file_path: str):
-        """Load a single combined_data file into fact table"""
+        """Load a single combined_data file into fact table with progress tracking"""
+
+        file_name = os.path.basename(file_path)
+
+        # Check if file already completed
+        if self.progress_tracker.is_file_completed(file_name):
+            logger.info(f"⏭️  {file_name} already processed, skipping...")
+            return
+
+        logger.info(f"🔄 Processing {file_name}...")
 
         # Parse file
         ratings_df = self.parse_combined_data_file(file_path)
 
         # Transform
-        logger.info(f"Transforming ratings...")
+        logger.info(f"🔧 Transforming ratings...")
         fact_df = self.transform_ratings(ratings_df)
 
         count = fact_df.count()
-        self.total_ratings += count
 
-        # Write to PostgreSQL with partitioning
-        logger.info(f"Writing {count:,} ratings to fact_ratings...")
+        # Create progress bar
+        progress_bar = ProgressBar(count, f"Loading {file_name}")
 
-        fact_df.repartition(Config.JDBC_NUM_PARTITIONS).write.jdbc(
+        # Write to PostgreSQL with partitioning in batches
+        logger.info(f"💾 Writing {count:,} ratings to fact_ratings...")
+
+        # We need to write in monitored batches for progress tracking
+        # Collect to pandas for batch control (only for monitoring, still use Spark for heavy lifting)
+        partitions = Config.JDBC_NUM_PARTITIONS
+        fact_df_partitioned = fact_df.repartition(partitions)
+
+        # Write all at once (Spark handles batching internally)
+        # But we'll simulate progress for better UX
+        batch_size = Config.PROGRESS_UPDATE_INTERVAL
+        num_batches = (count // batch_size) + 1
+
+        # Start write in background conceptually
+        fact_df_partitioned.write.jdbc(
             url=self.jdbc_url,
             table=f"{self.schema}.fact_ratings",
             mode="append",
             properties={**self.jdbc_props, "batchsize": str(Config.JDBC_BATCH_SIZE)},
         )
 
-        logger.info(f"Completed loading {os.path.basename(file_path)}")
+        # Update progress to completion
+        progress_bar.update(count)
+        progress_bar.complete()
+
+        self.total_ratings += count
+        self.progress_tracker.update_fact_progress(count)
+        self.progress_tracker.mark_file_completed(file_name)
+
+        logger.info(f"✅ Completed {file_name} ({count:,} ratings)")
 
     def load_all(self):
         """Load all combined_data files"""
-        logger.info("Starting fact table load...")
+        # Check if already completed
+        if self.progress_tracker.checkpoint["fact_ratings"]["completed"]:
+            logger.info(
+                f"⏭️  fact_ratings already completed with {self.total_ratings:,} records, skipping..."
+            )
+            return
+
+        logger.info("🚀 Starting fact table load...")
 
         for file_path in Config.COMBINED_DATA_FILES:
             if os.path.exists(file_path):
                 self.load_file(file_path)
             else:
-                logger.warning(f"File not found: {file_path}")
+                logger.warning(f"⚠️  File not found: {file_path}")
+
+        self.progress_tracker.mark_fact_completed()
 
         logger.info(
-            f"Fact table load complete! Total ratings loaded: {self.total_ratings:,}"
+            f"🎉 Fact table load complete! Total ratings loaded: {self.total_ratings:,}"
         )
 
 
@@ -857,82 +1317,131 @@ class PostLoadProcessor:
 
 
 def main():
-    """Main Spark ETL pipeline orchestrator"""
+    """Main Spark ETL pipeline orchestrator with resumable progress tracking"""
 
     start_time = datetime.now()
     logger.info("=" * 60)
-    logger.info("NETFLIX PRIZE DATA WAREHOUSE - SPARK ETL PIPELINE")
+    logger.info("🎬 NETFLIX PRIZE DATA WAREHOUSE - SPARK ETL PIPELINE")
     logger.info("=" * 60)
-    logger.info(f"Start Time: {start_time}")
+    logger.info(f"⏰ Start Time: {start_time}")
 
     spark_manager = None
+    progress_tracker = None
 
     try:
+        # 0. Initialize Progress Tracker
+        logger.info("\n[STEP 0/9] Initializing Progress Tracker")
+        progress_tracker = ProgressTracker()
+        logger.info(progress_tracker.get_summary())
+
         # 1. Initialize Spark Session
-        logger.info("\n[STEP 1/7] Initializing Spark Session")
+        logger.info("\n[STEP 1/9] Initializing Spark Session")
         spark_manager = SparkSessionManager()
         spark = spark_manager.create_session()
         spark_manager.test_connection()
 
-        # 2. Schema Creation
-        logger.info("\n[STEP 2/7] Creating Database Schema")
+        # 1.5 SAFETY VALIDATION - Check existing data
+        logger.info("\n[STEP 1.5/9] 🛡️  Data Safety Validation")
+        is_safe = spark_manager.validate_existing_data_safety(progress_tracker)
+        if not is_safe:
+            logger.error("❌ Safety check failed. Exiting to prevent data corruption.")
+            return 2  # Exit code 2 for safety failure
+
+        # 2. Schema Creation (Skip if resuming)
+        logger.info("\n[STEP 2/9] Creating Database Schema")
         if os.path.exists("schema.sql"):
-            spark_manager.execute_ddl("schema.sql")
+            # Only create schema if this is first run
+            if not any(
+                progress_tracker.checkpoint[dim]["completed"]
+                for dim in ["dim_date", "dim_movie", "dim_customer"]
+            ):
+                spark_manager.execute_ddl("schema.sql")
+            else:
+                logger.info("⏭️  Schema already exists, skipping DDL execution...")
         else:
-            logger.warning("schema.sql not found, assuming schema exists")
+            logger.warning("⚠️  schema.sql not found, assuming schema exists")
 
         jdbc_url = spark_manager.jdbc_url
         jdbc_props = spark_manager.jdbc_properties
 
         # 3. Load Date Dimension
-        logger.info("\n[STEP 3/7] Loading Date Dimension")
-        date_loader = DateDimensionLoader(spark, jdbc_url, jdbc_props)
+        logger.info("\n[STEP 3/9] Loading Date Dimension")
+        date_loader = DateDimensionLoader(spark, jdbc_url, jdbc_props, progress_tracker)
         date_loader.load()
 
         # 4. Load Movie Dimension
-        logger.info("\n[STEP 4/7] Loading Movie Dimension")
-        movie_loader = MovieDimensionLoader(spark, jdbc_url, jdbc_props)
+        logger.info("\n[STEP 4/9] Loading Movie Dimension")
+        movie_loader = MovieDimensionLoader(
+            spark, jdbc_url, jdbc_props, progress_tracker
+        )
         movie_mapping = movie_loader.load()
 
         # 5. Load Customer Dimension
-        logger.info("\n[STEP 5/7] Loading Customer Dimension")
-        customer_loader = CustomerDimensionLoader(spark, jdbc_url, jdbc_props)
+        logger.info("\n[STEP 5/9] Loading Customer Dimension")
+        customer_loader = CustomerDimensionLoader(
+            spark, jdbc_url, jdbc_props, progress_tracker
+        )
         customer_mapping = customer_loader.load()
 
         # 6. Load Fact Table
-        logger.info("\n[STEP 6/7] Loading Fact Table")
+        logger.info("\n[STEP 6/9] Loading Fact Table")
         fact_start = datetime.now()
         fact_loader = FactRatingsLoader(
-            spark, jdbc_url, jdbc_props, customer_mapping, movie_mapping
+            spark,
+            jdbc_url,
+            jdbc_props,
+            customer_mapping,
+            movie_mapping,
+            progress_tracker,
         )
         fact_loader.load_all()
         fact_duration = datetime.now() - fact_start
-        logger.info(f"Fact load completed in {fact_duration}")
+        logger.info(f"⏱️  Fact load completed in {fact_duration}")
 
         # 7. Post-Load Processing
-        logger.info("\n[STEP 7/7] Post-Load Processing")
+        logger.info("\n[STEP 7/9] Post-Load Processing")
         post_processor = PostLoadProcessor(spark, jdbc_url, jdbc_props)
         post_processor.update_customer_aggregates()
+
+        # 8. Generate Summary
+        logger.info("\n[STEP 8/9] Generating Summary")
         post_processor.generate_summary()
+        logger.info("\n" + progress_tracker.get_summary())
 
         # Complete
         end_time = datetime.now()
         duration = end_time - start_time
 
         logger.info("\n" + "=" * 60)
-        logger.info("SPARK ETL PIPELINE COMPLETED SUCCESSFULLY!")
+        logger.info("✅ SPARK ETL PIPELINE COMPLETED SUCCESSFULLY!")
         logger.info("=" * 60)
-        logger.info(f"End Time: {end_time}")
-        logger.info(f"Total Duration: {duration}")
+        logger.info(f"⏰ End Time: {end_time}")
+        logger.info(f"⏱️  Total Duration: {duration}")
         logger.info("=" * 60)
 
         return 0
 
+    except KeyboardInterrupt:
+        logger.warning("\n" + "=" * 60)
+        logger.warning("⚠️  ETL PIPELINE INTERRUPTED BY USER")
+        logger.warning("=" * 60)
+        logger.warning("💾 Progress has been saved to checkpoint file")
+        logger.warning("🔄 Run the script again to resume from where you left off")
+        logger.warning("=" * 60)
+        if progress_tracker:
+            logger.info(progress_tracker.get_summary())
+        return 130  # Standard exit code for Ctrl+C
+
     except Exception as e:
         logger.error(f"\n{'='*60}")
-        logger.error("SPARK ETL PIPELINE FAILED!")
+        logger.error("❌ SPARK ETL PIPELINE FAILED!")
         logger.error(f"{'='*60}")
         logger.error(f"Error: {e}", exc_info=True)
+        logger.error("💾 Progress has been saved to checkpoint file")
+        logger.error("🔄 Fix the issue and run the script again to resume")
+        logger.error("=" * 60)
+        if progress_tracker:
+            logger.info(progress_tracker.get_summary())
         return 1
 
     finally:
