@@ -1,0 +1,34 @@
+# Ignore environment variables
+.env
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ignore logs
+*.log
+etl_pipeline.log
+
+# Ignore virtual environment
+venv/
+env/
+ENV/
+
+# Ignore IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Keep example env
+!.env.example
+
+# Ignore dataset files
+/data
+*.pdf
