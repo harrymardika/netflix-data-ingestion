@@ -5,18 +5,23 @@
 ## 📋 Table of Contents
 
 - [Overview](#overview)
+- [Project Context](#project-context)
 - [Quick Start](#quick-start)
 - [Features](#features)
 - [Architecture](#architecture)
+- [Database Schema](#database-schema)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Docker Support](#docker-support)
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Resumable Processing Guide](#resumable-processing-guide)
 - [Safety Features](#safety-features)
+- [IT Governance & Compliance](#it-governance--compliance)
 - [Project Structure](#project-structure)
-- [Database Schema](#database-schema)
 - [Troubleshooting](#troubleshooting)
+- [Maintenance](#maintenance)
+- [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -37,6 +42,26 @@ This project implements a **production-grade, resumable ETL (Extract-Transform-L
 | **Rating Scale**         | 1-5 (integer)                      |
 | **Processing Framework** | Apache Spark 3.4+                  |
 | **Target Database**      | Azure PostgreSQL (Flexible Server) |
+
+### 🌍 Project Context
+
+#### Problem Statement
+
+The digital streaming industry generates millions of interactions daily. Without efficient Big Data processing, this leads to fragmented insights and irrelevant recommendations. This project implements a scalable architecture to transform raw data into strategic assets.
+
+#### Business Drivers
+
+- **Data-Driven Decisions**: Replacing intuition with empirical evidence.
+- **Hyper-Personalization**: Increasing user engagement through accurate recommendations.
+- **Churn Prediction**: Identifying at-risk users to improve retention.
+
+### 📊 Data Characteristics (The 5 Vs)
+
+- **Volume**: >100 million rating records (Gigabyte scale).
+- **Velocity**: Simulates continuous data stream ingestion.
+- **Variety**: Structured (ratings) and semi-structured (metadata) data.
+- **Veracity**: Includes validation for data integrity (e.g., rating range 1-5).
+- **Value**: Critical insights for recommendation systems and content optimization.
 
 ---
 
@@ -116,6 +141,54 @@ python etl_pipeline_spark.py
 ## 🏛️ Architecture
 
 ### Data Flow
+
+```mermaid
+flowchart LR
+    %% Data Model Architecture - Netflix Prize Data Warehouse
+
+    subgraph Source_Layer["Source Layer"]
+        SRC["Netflix Raw Dataset"]
+    end
+
+    subgraph ETL_Layer["ETL / Data Processing Layer"]
+        ETL1["Data Cleansing"]
+        ETL2["Data Transformation"]
+        ETL3["Surrogate Key Mapping"]
+    end
+
+    subgraph Dimension_Layer["Dimension Layer"]
+        DC["dim_customer"]
+        DM["dim_movie"]
+        DD["dim_date"]
+    end
+
+    subgraph Fact_Layer["Fact Layer"]
+        FR["fact_ratings"]
+    end
+
+    subgraph Analytics_Layer["Analytics / Reporting Layer"]
+        OLAP["OLAP Queries"]
+        BI["BI Dashboard"]
+        REP["Reporting & Insights"]
+    end
+
+    %% Data Flow
+    SRC --> ETL1 --> ETL2 --> ETL3
+
+    ETL3 --> DC
+    ETL3 --> DM
+    ETL3 --> DD
+
+    %% Star Schema Relationships
+    DC --> FR
+    DM --> FR
+    DD --> FR
+
+    %% Consumption Layer
+    FR --> OLAP
+    FR --> BI
+    FR --> REP
+```
 
 ```
 Raw Data Files (text/CSV)
@@ -243,7 +316,47 @@ data/
 
 ---
 
-## 🔐 Configuration
+## � Docker Support
+
+This project includes full Docker support for easy deployment and local development.
+
+### Quick Start with Docker
+
+**1. Local Development (with local PostgreSQL)**
+
+```bash
+# Create .env file
+cp .env.example .env
+
+# Start services
+docker-compose --profile local up --build
+```
+
+**2. Using Azure PostgreSQL**
+
+```bash
+# Configure .env with Azure credentials
+# Start ETL pipeline only
+docker-compose up --build
+```
+
+**3. Production Deployment**
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+### Docker Configuration
+
+- **Base Image**: `python:3.11-slim` with OpenJDK 17
+- **Services**: ETL Pipeline, PostgreSQL (local profile)
+- **Volumes**: Persistent checkpoints in `etl_checkpoints`
+
+For detailed Docker configuration, see `docker-compose.yml`.
+
+---
+
+## �🔐 Configuration
 
 ### Environment Variables
 
@@ -499,7 +612,7 @@ If issues are detected, the pipeline **stops automatically**:
 
 If you have existing data but no checkpoint, create one:
 
-```json
+````json
 {
   "dim_date": { "completed": true, "count": 2920 },
   "dim_movie": { "completed": true, "count": 17770 },
@@ -512,7 +625,58 @@ If you have existing data but no checkpoint, create one:
     "current_file_offset": 0
   },
   "last_updated": "2025-12-15T14:30:45.123456"
-}
+}Entity Relationship Diagram (ERD)
+
+```mermaid
+erDiagram
+
+    DIM_DATE {
+        INTEGER date_key PK
+        DATE date_actual
+        SMALLINT year
+        SMALLINT month
+        SMALLINT day
+        SMALLINT quarter
+        SMALLINT day_of_week
+        VARCHAR month_name
+        BOOLEAN is_weekend
+        TIMESTAMP created_at
+    }
+
+    DIM_MOVIE {
+        INTEGER movie_key PK
+        INTEGER movie_id
+        VARCHAR title
+        SMALLINT release_year
+        TIMESTAMP created_at
+    }
+
+    DIM_CUSTOMER {
+        INTEGER customer_key PK
+        INTEGER customer_id
+        DATE first_rating_date
+        DATE last_rating_date
+        INTEGER total_ratings
+        TIMESTAMP created_at
+    }
+
+    FACT_RATINGS {
+        BIGINT rating_key PK
+        INTEGER customer_key FK
+        INTEGER movie_key FK
+        INTEGER date_key FK
+        SMALLINT rating
+        TIMESTAMP rating_timestamp
+        TIMESTAMP created_at
+    }
+
+    DIM_CUSTOMER ||--o{ FACT_RATINGS : "customer_key"
+    DIM_MOVIE    ||--o{ FACT_RATINGS : "movie_key"
+    DIM_DATE     ||--o{ FACT_RATINGS : "date_key"
+````
+
+###
+
 ```
 
 ### What's Protected
@@ -527,34 +691,50 @@ If you have existing data but no checkpoint, create one:
 
 ---
 
+## ⚖️ IT Governance & Compliance
+
+### Security
+- **Authentication**: Encrypted database connections (SSL/TLS).
+- **RBAC**: Role-Based Access Control separation between admin and analysts.
+- **Credential Management**: Environment variables (`.env`) for sensitive data.
+
+### Compliance & Privacy
+- **Audit Trail**: Timestamp logging (`created_at`) for all data ingestion.
+- **Anonymization**: User IDs are anonymized; no PII (Personally Identifiable Information) is stored.
+- **Data Quality**: Range validation (1-5 ratings) and referential integrity checks.
+
+---
+
 ## �📁 Project Structure
 
 ```
+
 netflix-data-ingestion/
-├── etl_pipeline_spark.py          # Main ETL pipeline with resumable features
-├── schema.sql                     # Database DDL script
-├── requirements.txt               # Python dependencies
-├── .env.example                   # Environment template
-├── .env                          # Configuration (git-ignored)
-├── .gitignore                    # Git ignore rules
-├── README.md                     # This file
-├── test.ipynb                    # Jupyter notebook for testing/monitoring
+├── etl_pipeline_spark.py # Main ETL pipeline with resumable features
+├── schema.sql # Database DDL script
+├── requirements.txt # Python dependencies
+├── .env.example # Environment template
+├── .env # Configuration (git-ignored)
+├── .gitignore # Git ignore rules
+├── README.md # This file
+├── test.ipynb # Jupyter notebook for testing/monitoring
 │
-├── data/                         # Data directory
-│   ├── movie_titles.csv         # 17K movie titles
-│   ├── combined_data_1.txt      # 25M ratings
-│   ├── combined_data_2.txt      # 25M ratings
-│   ├── combined_data_3.txt      # 25M ratings
-│   └── combined_data_4.txt      # 25M ratings
+├── data/ # Data directory
+│ ├── movie_titles.csv # 17K movie titles
+│ ├── combined_data_1.txt # 25M ratings
+│ ├── combined_data_2.txt # 25M ratings
+│ ├── combined_data_3.txt # 25M ratings
+│ └── combined_data_4.txt # 25M ratings
 │
-├── hadoop/                       # Hadoop binaries (Windows compatibility)
-│   └── bin/                     # Executable files
+├── hadoop/ # Hadoop binaries (Windows compatibility)
+│ └── bin/ # Executable files
 │
-├── postgresql-42.6.0.jar        # PostgreSQL JDBC driver
-├── etl_pipeline_spark.log       # Execution log (auto-generated)
-├── etl_checkpoint.json           # Progress checkpoint (auto-generated)
-└── __pycache__/                 # Python cache (git-ignored)
-```
+├── postgresql-42.6.0.jar # PostgreSQL JDBC driver
+├── etl_pipeline_spark.log # Execution log (auto-generated)
+├── etl_checkpoint.json # Progress checkpoint (auto-generated)
+└── **pycache**/ # Python cache (git-ignored)
+
+````
 
 ---
 
@@ -582,7 +762,7 @@ PRIMARY KEY (rating_key)
 FOREIGN KEY (customer_key) → dim_customer(customer_key)
 FOREIGN KEY (movie_key) → dim_movie(movie_key)
 FOREIGN KEY (date_key) → dim_date(date_key)
-```
+````
 
 #### **Dimension Table: dim_date**
 
@@ -1001,241 +1181,6 @@ Use the provided `test.ipynb` notebook to:
 
 ---
 
-## 🏆 Success Criteria
-
-Your ETL pipeline has succeeded when:
-
-✅ All 4 combined data files processed  
-✅ `etl_checkpoint.json` shows all completed  
-✅ Database has 100M+ records in fact_ratings  
-✅ No errors in `etl_pipeline_spark.log`  
-✅ Sample queries return expected results
-
----
-
-## 🎯 Star Schema Summary
-
-```
-┌─────────────────┐
-│   dim_date      │ (2,650 rows)
-│ date_key (PK)   │
-│ year, month...  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│ dim_customer    │      │  fact_ratings   │      │   dim_movie     │
-│ customer_key(PK)│◄─────┤ rating_key (PK) ├─────►│ movie_key (PK)  │
-│ customer_id     │      │ customer_key(FK)│      │ movie_id        │
-│ ~480K rows      │      │ movie_key (FK)  │      │ title           │
-└─────────────────┘      │ date_key (FK)   │      │ ~17K rows       │
-                         │ rating (1-5)    │      └─────────────────┘
-                         │ ~100M rows      │
-                         └─────────────────┘
-```
-
-### Key Design Decisions
-
-✅ **Surrogate Keys**: All dimensions use auto-increment surrogate keys  
-✅ **Date Dimension**: Proper time dimension instead of raw dates  
-✅ **Referential Integrity**: FK constraints enforced  
-✅ **Denormalization**: Optimized for analytical queries  
-✅ **Strategic Indexing**: Multi-column indexes for common patterns  
-✅ **Type Optimization**: SMALLINT for ratings, BIGSERIAL for fact PK
-
----
-
-## 🚀 Quick Start
-
-### 1. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Configure Database
-
-```bash
-cp .env.example .env
-# Edit .env with your Azure PostgreSQL credentials
-```
-
-### 3. Run ETL Pipeline
-
-```bash
-python etl_pipeline.py
-```
-
-**Expected Duration**: 2.5-4.5 hours (100M rows)
-
----
-
-## 📊 What Gets Created
-
-| Object                   | Type  | Rows         | Description                |
-| ------------------------ | ----- | ------------ | -------------------------- |
-| `dim_date`               | Table | ~2,650       | Date dimension (1998-2005) |
-| `dim_movie`              | Table | 17,770       | Movie dimension            |
-| `dim_customer`           | Table | ~480,189     | Customer dimension         |
-| `fact_ratings`           | Table | ~100,480,507 | Rating events (FACT)       |
-| `v_daily_rating_summary` | View  | -            | Daily aggregates           |
-| `v_movie_performance`    | View  | -            | Movie-level metrics        |
-
----
-
-## 🎓 Star Schema Best Practices Applied
-
-1. ✅ **Grain Definition**: One fact row = one rating event
-2. ✅ **Conformed Dimensions**: Shared date dimension for temporal analysis
-3. ✅ **Surrogate Keys**: Decoupled from natural keys
-4. ✅ **Slowly Changing Dimensions**: Type 1 SCD (current state only)
-5. ✅ **Fact Table Optimization**: Only FKs and measures
-6. ✅ **Query Performance**: Denormalized dimensions
-7. ✅ **Scalability**: Handles 100M+ rows efficiently
-8. ✅ **BI Tool Ready**: Standard star schema pattern
-
----
-
-## 🔍 Verification Checklist
-
-After ETL completion, verify:
-
-- [ ] **Row Counts Match**:
-
-  - dim_date: 2,650 ✓
-  - dim_movie: 17,770 ✓
-  - dim_customer: ~480,189 ✓
-  - fact_ratings: ~100,480,507 ✓
-
-- [ ] **No Orphaned Records**: All FKs resolve
-
-- [ ] **Data Quality**:
-
-  - Ratings are 1-5 (integer)
-  - Dates within 1998-2005
-  - No NULL surrogate keys
-
-- [ ] **Customer Aggregates Updated**:
-
-  - first_rating_date populated
-  - total_ratings > 0
-
-- [ ] **Indexes Created**: Check with `\d+ fact_ratings` in psql
-
----
-
-## 💡 Use Cases Enabled
-
-### 1. **Collaborative Filtering (ML)**
-
-```python
-# User-item matrix for recommendation systems
-query = """
-SELECT customer_key, movie_key, rating
-FROM netflix_dw.fact_ratings
-"""
-```
-
-### 2. **Trend Analysis**
-
-```sql
--- Rating volume over time
-SELECT d.year, d.month, COUNT(*) as ratings
-FROM netflix_dw.fact_ratings f
-JOIN netflix_dw.dim_date d ON f.date_key = d.date_key
-GROUP BY d.year, d.month
-ORDER BY d.year, d.month;
-```
-
-### 3. **Movie Recommendations**
-
-```sql
--- Similar customers (who rated the same movies highly)
--- Top-rated movies by genre/year
--- Cold-start problem analysis
-```
-
-### 4. **Business Intelligence**
-
-- Tableau/Power BI dashboards
-- Customer segmentation
-- Content performance analysis
-- Temporal rating patterns
-
----
-
-## ⚙️ Technical Specifications
-
-### Database
-
-- **Platform**: Azure Database for PostgreSQL (Flexible Server)
-- **Schema**: `netflix_dw`
-- **Total Size**: ~15-20 GB (including indexes)
-- **Performance**: Optimized for OLAP queries
-
-### Python Requirements
-
-- **Version**: Python 3.9+
-- **Key Libraries**: pandas, SQLAlchemy, psycopg2-binary, python-dotenv
-- **Memory**: 4GB+ RAM recommended
-- **Processing**: Single-threaded (can be parallelized)
-
-### ETL Characteristics
-
-- **Idempotent**: Safe to re-run
-- **Chunked Processing**: 50K rows per batch
-- **Error Handling**: Graceful skips for malformed data
-- **Logging**: Detailed progress tracking
-- **Resumability**: Can restart from schema creation
-
----
-
-## 📈 Performance Metrics
-
-### ETL Pipeline
-
-| Stage              | Duration   | Throughput          |
-| ------------------ | ---------- | ------------------- |
-| Date Dimension     | ~2 sec     | 1,325 rows/sec      |
-| Movie Dimension    | ~5 sec     | 3,554 rows/sec      |
-| Customer Dimension | ~5 min     | 1,600 rows/sec      |
-| **Fact Table**     | **~3 hrs** | **~9,300 rows/sec** |
-| Post-Processing    | ~10 min    | -                   |
-
-### Query Performance (Post-ANALYZE)
-
-- Simple aggregations: <1 second
-- Complex JOINs (3 tables): 1-5 seconds
-- Full table scans: 10-30 seconds
-
-**Note**: Performance depends on Azure tier (vCores, memory, IOPS)
-
----
-
-## 🛡️ Data Governance
-
-### Security
-
-- ✅ Credentials via `.env` (not hardcoded)
-- ✅ `.gitignore` prevents credential leaks
-- ✅ Azure SSL/TLS encryption supported
-- ✅ Role-based access control (configure in Azure)
-
-### Data Quality
-
-- ✅ CHECK constraints on ratings (1-5)
-- ✅ Foreign key integrity enforced
-- ✅ Unique constraints on natural keys
-- ✅ NOT NULL on critical fields
-
-### Audit Trail
-
-- ✅ `created_at` timestamp on all tables
-- ✅ `rating_timestamp` preserved in fact table
-- ✅ ETL logs with timestamps
-
----
-
 ## 🔄 Maintenance
 
 ### Regular Tasks
@@ -1264,7 +1209,7 @@ ORDER BY d.year, d.month;
 
 ---
 
-## 📞 Next Steps
+## � Future Roadmap
 
 ### Immediate Actions
 
@@ -1282,33 +1227,3 @@ ORDER BY d.year, d.month;
 - [ ] Implement incremental loads (CDC)
 - [ ] Add data quality monitoring
 - [ ] Create Tableau/Power BI templates
-
----
-
-## 🎉 Success Criteria
-
-You'll know it worked when:
-
-✅ All tables created with correct row counts  
-✅ No referential integrity violations  
-✅ Sample analytical queries return results in <5 seconds  
-✅ Customer aggregates populated correctly  
-✅ `etl_pipeline.log` shows "COMPLETED SUCCESSFULLY"  
-✅ You can run ML models on the user-item rating matrix
-
----
-
-## 📚 Additional Resources
-
-- **Dataset**: [Netflix Prize on Academic Torrents](http://academictorrents.com/details/9b13183dc4d60676b773c9e2cd6de5e5542cee9a)
-- **Star Schema**: [Kimball Group - Data Warehouse Toolkit](https://www.kimballgroup.com/)
-- **PostgreSQL**: [Official Documentation](https://www.postgresql.org/docs/)
-- **Azure PostgreSQL**: [Microsoft Docs](https://docs.microsoft.com/en-us/azure/postgresql/)
-
----
-
-**Project Status**: ✅ Production Ready  
-**Version**: 1.0  
-**Last Updated**: December 14, 2025
-
-**Questions?** Check `SETUP_GUIDE.md` for troubleshooting.
