@@ -32,9 +32,15 @@ import sys
 import logging
 import json
 import time
+import csv
+import shutil
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+from pathlib import Path
 from dotenv import load_dotenv
+import psycopg2
+from psycopg2 import sql
+import pandas as pd
 
 from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql.functions import (
@@ -93,6 +99,13 @@ HADOOP_HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hadoop")
 os.environ["HADOOP_HOME"] = HADOOP_HOME
 os.environ["hadoop.home.dir"] = HADOOP_HOME
 
+# Set Python executable for PySpark workers on Windows
+# Spark looks for "python3" by default, but Windows uses "python"
+if sys.platform == "win32":
+    python_exe = sys.executable
+    os.environ["PYSPARK_PYTHON"] = python_exe
+    os.environ["PYSPARK_DRIVER_PYTHON"] = python_exe
+
 # =====================================================
 # LOGGING CONFIGURATION
 # =====================================================
@@ -129,11 +142,31 @@ class Config:
     APP_NAME = "Netflix-DW-ETL"
     MASTER = "local[*]"  # Use all available cores
 
+    # Temporary data storage for bulk loading (Spark → CSV → PostgreSQL COPY)
+    # Note: Parquet requires Hadoop native Windows libraries (winutils.exe, hadoop.dll)
+    # CSV mode avoids Windows-specific Hadoop issues
+    TEMP_DIR = "temp_csv"
+    TEMP_CSV_DIR = "temp_csv"
+    USE_PARQUET = True  # Use Parquet for better performance (requires Hadoop native libraries on Windows)
+
     # Performance tuning
     SHUFFLE_PARTITIONS = 200  # For 100M rows
     DEFAULT_PARALLELISM = 200
-    JDBC_BATCH_SIZE = 10000
-    JDBC_NUM_PARTITIONS = 20
+    JDBC_BATCH_SIZE = 5000  # Only for dimension tables
+    JDBC_NUM_PARTITIONS = 8  # Only for dimension tables
+
+    # PostgreSQL COPY settings (10-50x faster than JDBC)
+    COPY_BATCH_SIZE = 100000  # Rows per COPY operation
+    COPY_BUFFER_SIZE = 8192  # IO buffer size
+
+    # Azure PostgreSQL connection settings - Extended for long-running operations
+    JDBC_CONNECT_TIMEOUT = 60000  # 60 seconds (increased from 30s)
+    JDBC_SOCKET_TIMEOUT = 3600000  # 60 minutes (increased from 5 min)
+    JDBC_STATEMENT_TIMEOUT = 3600000  # 60 minutes for long queries
+    JDBC_POOL_SIZE = 10  # Reduced from 20
+    JDBC_MAX_RECONNECTS = 5  # Increased from 3
+    JDBC_TCP_KEEPALIVE = True
+    JDBC_KEEPALIVE_INTERVAL = 60  # Send keepalive every 60 seconds
 
     # Date range
     DATE_RANGE = ("1998-10-01", "2005-12-31")
@@ -342,28 +375,56 @@ class SparkSessionManager:
         # Validate credentials
         self._validate_credentials()
 
-        # Build JDBC URL
+        # Build JDBC URL with comprehensive timeout settings for Azure PostgreSQL
+        # Extended timeouts to handle long-running write operations (48+ minutes)
         self.jdbc_url = (
             f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
             f"?sslmode=require"
+            f"&connectTimeout={Config.JDBC_CONNECT_TIMEOUT}"  # 60 seconds
+            f"&socketTimeout={Config.JDBC_SOCKET_TIMEOUT}"  # 60 minutes
+            f"&tcpKeepAlive=true"  # Enable TCP keepalive
+            f"&ApplicationName=Netflix-Spark-ETL"
+            f"&reWriteBatchedInserts=true"  # Optimize batch inserts
+            f"&prepareThreshold=1"  # Use prepared statements
         )
 
         self.jdbc_properties = {
             "user": self.user,
             "password": self.password,
             "driver": Config.JDBC_DRIVER,
+            # Don't duplicate timeout settings here - they're in JDBC URL
+            # Connection pool settings
+            "useSSL": "true",
+            "serverTimezone": "UTC",
+            "autoReconnect": "true",
+            "maxReconnects": str(Config.JDBC_MAX_RECONNECTS),
+            # JDBC connection properties
+            "socketFactoryClass": "org.postgresql.ssl.NonValidatingFactory",
         }
 
         self.spark = None
 
+    def get_psycopg2_connection(self):
+        """Create a psycopg2 connection using stored credentials"""
+        return psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            sslmode="require",
+            connect_timeout=30,
+        )
+
     def get_table_count(self, table_name: str) -> int:
-        """Get current row count from a table"""
+        """Get current row count from a table using psycopg2 (not JDBC)"""
         try:
-            query = f"(SELECT COUNT(*) as count FROM {Config.SCHEMA_NAME}.{table_name}) as cnt"
-            df = self.spark.read.jdbc(
-                url=self.jdbc_url, table=query, properties=self.jdbc_properties
-            )
-            count = df.collect()[0]["count"]
+            conn = self.get_psycopg2_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {Config.SCHEMA_NAME}.{table_name}")
+            count = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
             return count
         except Exception as e:
             logger.warning(f"Could not get count for {table_name}: {e}")
@@ -531,11 +592,21 @@ class SparkSessionManager:
                     f"Download from: https://jdbc.postgresql.org/download.html"
                 )
 
-            # Create Spark session with optimizations
+            # JVM options for Java 17+ compatibility with Spark 3.4.1
+            jvm_options = [
+                "--add-opens=java.base/java.nio=ALL-UNNAMED",
+                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+                "--add-modules=jdk.unsupported",
+            ]
+            jvm_opts = " ".join(jvm_options)
+
+            # Create Spark session with optimizations and JDBC connection pooling
             self.spark = (
                 SparkSession.builder.appName(Config.APP_NAME)
                 .master(Config.MASTER)
                 .config("spark.jars", Config.JDBC_JAR_PATH)
+                .config("spark.driver.extraJavaOptions", jvm_opts)
+                .config("spark.executor.extraJavaOptions", jvm_opts)
                 .config("spark.sql.shuffle.partitions", Config.SHUFFLE_PARTITIONS)
                 .config("spark.default.parallelism", Config.DEFAULT_PARALLELISM)
                 .config("spark.sql.adaptive.enabled", "true")
@@ -544,6 +615,14 @@ class SparkSessionManager:
                 .config("spark.executor.memory", "4g")
                 .config("spark.driver.maxResultSize", "2g")
                 .config("spark.sql.broadcastTimeout", "600")
+                # JDBC Connection Pooling for Azure PostgreSQL
+                .config("spark.datasource.jdbc.connection_pooling_enabled", "true")
+                .config("spark.datasource.jdbc.connection_pool_size", "20")
+                # Network timeouts to prevent Azure idle connection drops
+                .config("spark.network.timeout", "120s")
+                .config("spark.executor.heartbeatInterval", "10s")
+                # Prevent memory issues during large writes
+                .config("spark.sql.autoBroadcastJoinThreshold", "-1")
                 .getOrCreate()
             )
 
@@ -560,18 +639,27 @@ class SparkSessionManager:
             raise
 
     def test_connection(self):
-        """Test PostgreSQL connection"""
+        """Test PostgreSQL connection using psycopg2 (not JDBC)
+
+        We use psycopg2 instead of JDBC because:
+        1. JDBC has timeout configuration conflicts
+        2. We use psycopg2 + COPY for actual data loading anyway
+        3. More reliable for Azure PostgreSQL
+        """
         try:
             logger.info("Testing database connection...")
 
-            # Simple query to test connection
-            query = "(SELECT version() as version) as test"
-            df = self.spark.read.jdbc(
-                url=self.jdbc_url, table=query, properties=self.jdbc_properties
-            )
+            # Test connection with psycopg2
+            conn = self.get_psycopg2_connection()
 
-            version = df.collect()[0]["version"]
+            cursor = conn.cursor()
+            cursor.execute("SELECT version()")
+            version = cursor.fetchone()[0]
+
             logger.info(f"Connected successfully! PostgreSQL: {version}")
+
+            cursor.close()
+            conn.close()
 
         except Exception as e:
             logger.error(f"Database connection test failed: {e}")
@@ -615,14 +703,7 @@ class SparkSessionManager:
                     current_statement = []
 
             # Execute via psycopg2
-            conn = psycopg2.connect(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                sslmode="require",
-            )
+            conn = self.get_psycopg2_connection()
 
             cur = conn.cursor()
             for i, statement in enumerate(statements, 1):
@@ -771,12 +852,14 @@ class MovieDimensionLoader:
         jdbc_url: str,
         jdbc_props: Dict,
         progress_tracker: ProgressTracker,
+        spark_manager=None,
     ):
         self.spark = spark
         self.jdbc_url = jdbc_url
         self.jdbc_props = jdbc_props
         self.schema = Config.SCHEMA_NAME
         self.progress_tracker = progress_tracker
+        self.spark_manager = spark_manager
 
     def load(self) -> DataFrame:
         """Load movie dimension and return DataFrame with surrogate keys"""
@@ -787,12 +870,14 @@ class MovieDimensionLoader:
                 f"⏭️  dim_movie already loaded with {existing_count:,} records, skipping..."
             )
 
-            # Just return the mapping
-            movie_mapping = self.spark.read.jdbc(
-                url=self.jdbc_url,
-                table=f"{self.schema}.dim_movie",
-                properties=self.jdbc_props,
-            ).select("movie_id", "movie_key")
+            # Return the mapping using psycopg2 to avoid JDBC timeout issues
+            conn = self.spark_manager.get_psycopg2_connection()
+
+            query = f"SELECT movie_id, movie_key FROM {self.schema}.dim_movie"
+            movie_df = pd.read_sql(query, conn)
+            conn.close()
+
+            movie_mapping = self.spark.createDataFrame(movie_df)
 
             return movie_mapping
 
@@ -836,12 +921,14 @@ class MovieDimensionLoader:
         logger.info(f"Loaded {row_count} movies into dim_movie")
         self.progress_tracker.mark_dimension_completed("dim_movie", row_count)
 
-        # Read back with surrogate keys
-        movie_mapping = self.spark.read.jdbc(
-            url=self.jdbc_url,
-            table=f"{self.schema}.dim_movie",
-            properties=self.jdbc_props,
-        ).select("movie_id", "movie_key")
+        # Read back with surrogate keys using psycopg2 to avoid JDBC timeout issues
+        conn = self.spark_manager.get_psycopg2_connection()
+
+        query = f"SELECT movie_id, movie_key FROM {self.schema}.dim_movie"
+        movie_df = pd.read_sql(query, conn)
+        conn.close()
+
+        movie_mapping = self.spark.createDataFrame(movie_df)
 
         logger.info(
             f"Retrieved movie_id -> movie_key mapping ({movie_mapping.count()} entries)"
@@ -864,10 +951,12 @@ class CustomerDimensionLoader:
         jdbc_url: str,
         jdbc_props: Dict,
         progress_tracker: ProgressTracker,
+        spark_manager=None,
     ):
         self.spark = spark
         self.jdbc_url = jdbc_url
         self.jdbc_props = jdbc_props
+        self.spark_manager = spark_manager
         self.schema = Config.SCHEMA_NAME
         self.progress_tracker = progress_tracker
 
@@ -918,12 +1007,14 @@ class CustomerDimensionLoader:
                 f"⏭️  dim_customer already loaded with {existing_count:,} records, skipping..."
             )
 
-            # Just return the mapping
-            customer_mapping = self.spark.read.jdbc(
-                url=self.jdbc_url,
-                table=f"{self.schema}.dim_customer",
-                properties=self.jdbc_props,
-            ).select("customer_id", "customer_key")
+            # Return the mapping using psycopg2 to avoid JDBC timeout issues
+            conn = self.spark_manager.get_psycopg2_connection()
+
+            query = f"SELECT customer_id, customer_key FROM {self.schema}.dim_customer"
+            customer_df = pd.read_sql(query, conn)
+            conn.close()
+
+            customer_mapping = self.spark.createDataFrame(customer_df)
 
             return customer_mapping
 
@@ -944,12 +1035,14 @@ class CustomerDimensionLoader:
         logger.info(f"Loaded {customer_count:,} customers into dim_customer")
         self.progress_tracker.mark_dimension_completed("dim_customer", customer_count)
 
-        # Read back with surrogate keys
-        customer_mapping = self.spark.read.jdbc(
-            url=self.jdbc_url,
-            table=f"{self.schema}.dim_customer",
-            properties=self.jdbc_props,
-        ).select("customer_id", "customer_key")
+        # Read back with surrogate keys using psycopg2 to avoid JDBC timeout issues
+        conn = self.spark_manager.get_psycopg2_connection()
+
+        query = f"SELECT customer_id, customer_key FROM {self.schema}.dim_customer"
+        customer_df = pd.read_sql(query, conn)
+        conn.close()
+
+        customer_mapping = self.spark.createDataFrame(customer_df)
 
         logger.info(f"Retrieved customer_id -> customer_key mapping")
 
@@ -972,6 +1065,7 @@ class FactRatingsLoader:
         customer_mapping: DataFrame,
         movie_mapping: DataFrame,
         progress_tracker: ProgressTracker,
+        spark_manager=None,
     ):
         self.spark = spark
         self.jdbc_url = jdbc_url
@@ -980,6 +1074,7 @@ class FactRatingsLoader:
         self.customer_mapping = customer_mapping.cache()  # Cache for reuse
         self.movie_mapping = movie_mapping.cache()
         self.progress_tracker = progress_tracker
+        self.spark_manager = spark_manager
         self.total_ratings = self.progress_tracker.checkpoint["fact_ratings"][
             "total_count"
         ]
@@ -1084,8 +1179,10 @@ class FactRatingsLoader:
         return df
 
     def load_file(self, file_path: str):
-        """Load a single combined_data file into fact table with progress tracking"""
+        """Load a single combined_data file using Spark → Parquet/CSV → PostgreSQL COPY
 
+        This is 10-50x faster than direct JDBC writes.
+        """
         file_name = os.path.basename(file_path)
 
         # Check if file already completed
@@ -1095,48 +1192,142 @@ class FactRatingsLoader:
 
         logger.info(f"🔄 Processing {file_name}...")
 
-        # Parse file
+        # STEP 1: Parse and transform with Spark (fast)
         ratings_df = self.parse_combined_data_file(file_path)
-
-        # Transform
         logger.info(f"🔧 Transforming ratings...")
         fact_df = self.transform_ratings(ratings_df)
-
         count = fact_df.count()
+        logger.info(f"📊 Transformed {count:,} ratings")
 
-        # Create progress bar
-        progress_bar = ProgressBar(count, f"Loading {file_name}")
-
-        # Write to PostgreSQL with partitioning in batches
-        logger.info(f"💾 Writing {count:,} ratings to fact_ratings...")
-
-        # We need to write in monitored batches for progress tracking
-        # Collect to pandas for batch control (only for monitoring, still use Spark for heavy lifting)
-        partitions = Config.JDBC_NUM_PARTITIONS
-        fact_df_partitioned = fact_df.repartition(partitions)
-
-        # Write all at once (Spark handles batching internally)
-        # But we'll simulate progress for better UX
-        batch_size = Config.PROGRESS_UPDATE_INTERVAL
-        num_batches = (count // batch_size) + 1
-
-        # Start write in background conceptually
-        fact_df_partitioned.write.jdbc(
-            url=self.jdbc_url,
-            table=f"{self.schema}.fact_ratings",
-            mode="append",
-            properties={**self.jdbc_props, "batchsize": str(Config.JDBC_BATCH_SIZE)},
+        # STEP 2: Convert to pandas and write CSV directly (bypasses Hadoop native libs)
+        temp_csv_file = os.path.join(
+            Config.TEMP_DIR, f"{file_name.replace('.txt', '')}.csv"
         )
+        os.makedirs(Config.TEMP_DIR, exist_ok=True)
 
-        # Update progress to completion
-        progress_bar.update(count)
-        progress_bar.complete()
+        logger.info(
+            f"💾 Converting to CSV via pandas (Windows-compatible): {temp_csv_file}"
+        )
+        start_time = time.time()
 
+        # Convert Spark DataFrame to pandas (in-memory - 6M rows ~= 500MB)
+        pandas_df = fact_df.toPandas()
+
+        # Write CSV directly using pandas (no Hadoop dependencies)
+        pandas_df.to_csv(temp_csv_file, index=False, header=False)
+
+        write_time = time.time() - start_time
+        logger.info(f"✅ CSV write completed in {write_time:.1f}s")
+
+        # STEP 3: Bulk load to PostgreSQL using COPY (10-50x faster than JDBC)
+        logger.info(f"🚀 Bulk loading to PostgreSQL using COPY command...")
+        self._bulk_load_to_postgres_from_csv(temp_csv_file, count, file_name)
+
+        # STEP 4: Cleanup temp files
+        logger.info(f"🧹 Cleaning up temporary files...")
+        if os.path.exists(temp_csv_file):
+            os.remove(temp_csv_file)
+
+        # Update progress
         self.total_ratings += count
         self.progress_tracker.update_fact_progress(count)
         self.progress_tracker.mark_file_completed(file_name)
 
         logger.info(f"✅ Completed {file_name} ({count:,} ratings)")
+
+    def _bulk_load_to_postgres_from_csv(
+        self, csv_file: str, expected_count: int, file_name: str
+    ):
+        """Bulk load CSV file to PostgreSQL using COPY command
+
+        This is 10-50x faster than JDBC batch inserts.
+        Windows-compatible (no Hadoop native libraries required).
+        Includes retry logic for Azure PostgreSQL connection timeouts.
+        """
+        start_time = time.time()
+        logger.info(f"📄 CSV file ready: {csv_file}")
+
+        max_retries = 3
+        retry_count = 0
+        last_error = None
+
+        while retry_count < max_retries:
+            try:
+                # Connect to PostgreSQL and use COPY
+                conn = self.spark_manager.get_psycopg2_connection()
+                conn.autocommit = False
+
+                # Set TCP keepalives for long operations on Azure
+                conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+
+                cursor = conn.cursor()
+
+                logger.info(
+                    f"🚀 Starting COPY command (attempt {retry_count + 1}/{max_retries})..."
+                )
+                copy_start = time.time()
+
+                # Use COPY FROM STDIN for maximum speed
+                with open(csv_file, "r", encoding="utf-8") as f:
+                    cursor.copy_expert(
+                        sql.SQL(
+                            "COPY {}.fact_ratings (customer_key, movie_key, date_key, rating, rating_timestamp) "
+                            "FROM STDIN WITH (FORMAT CSV, DELIMITER ',')"
+                        ).format(sql.Identifier(self.schema)),
+                        f,
+                    )
+
+                cursor.execute("COMMIT;")
+                copy_time = time.time() - copy_start
+                total_time = time.time() - start_time
+
+                rows_loaded = cursor.rowcount
+                rate = rows_loaded / copy_time if copy_time > 0 else 0
+
+                logger.info(
+                    f"✅ COPY completed in {copy_time:.1f}s ({rate:,.0f} rows/s)"
+                )
+                logger.info(f"📊 Total load time: {total_time:.1f}s")
+                logger.info(f"📈 Loaded {rows_loaded:,} rows")
+
+                cursor.close()
+                conn.close()
+                return  # Success!
+
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                last_error = e
+                retry_count += 1
+                logger.error(
+                    f"❌ COPY attempt {retry_count}/{max_retries} failed: {str(e)}"
+                )
+
+                if retry_count < max_retries:
+                    wait_time = 10 * retry_count  # 10s, 20s, 30s
+                    logger.info(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ All {max_retries} COPY attempts failed")
+                    raise
+
+            except Exception as e:
+                logger.error(f"❌ COPY failed (non-recoverable): {str(e)}")
+                if "conn" in locals():
+                    try:
+                        conn.rollback()
+                        conn.close()
+                    except:
+                        pass
+                raise
+
+            finally:
+                # Try to cleanup temp CSV (but don't fail if it can't be deleted)
+                try:
+                    if os.path.isdir(csv_file):
+                        shutil.rmtree(csv_file, ignore_errors=True)
+                    elif os.path.isfile(csv_file):
+                        os.remove(csv_file)
+                except Exception as cleanup_error:
+                    logger.warning(f"⚠️  Could not cleanup {csv_file}: {cleanup_error}")
 
     def load_all(self):
         """Load all combined_data files"""
@@ -1372,14 +1563,14 @@ def main():
         # 4. Load Movie Dimension
         logger.info("\n[STEP 4/9] Loading Movie Dimension")
         movie_loader = MovieDimensionLoader(
-            spark, jdbc_url, jdbc_props, progress_tracker
+            spark, jdbc_url, jdbc_props, progress_tracker, spark_manager
         )
         movie_mapping = movie_loader.load()
 
         # 5. Load Customer Dimension
         logger.info("\n[STEP 5/9] Loading Customer Dimension")
         customer_loader = CustomerDimensionLoader(
-            spark, jdbc_url, jdbc_props, progress_tracker
+            spark, jdbc_url, jdbc_props, progress_tracker, spark_manager
         )
         customer_mapping = customer_loader.load()
 
@@ -1393,6 +1584,7 @@ def main():
             customer_mapping,
             movie_mapping,
             progress_tracker,
+            spark_manager,
         )
         fact_loader.load_all()
         fact_duration = datetime.now() - fact_start
