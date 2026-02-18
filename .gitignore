@@ -42,3 +42,6 @@ etl_checkpoint.json
 
 # Ignore Hadoop binaries
 /hadoop/
+
+# Ignore Docker files
+docker-compose.yml

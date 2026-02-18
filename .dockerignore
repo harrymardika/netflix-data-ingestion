@@ -1,0 +1,58 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+*.egg
+*.whl
+build/
+dist/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+docs/
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+*.tmp
+*.bak
+.temp/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Hadoop (not needed in container)
+hadoop/
+
+# Large files
+*.tar
+*.gz
+*.zip
