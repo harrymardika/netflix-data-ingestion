@@ -166,7 +166,7 @@ psycopg2-binary>=2.9.0
 ### 1. Clone Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/harrymardika/netflix-data-ingestion.git
 cd netflix-data-ingestion
 ```
 
